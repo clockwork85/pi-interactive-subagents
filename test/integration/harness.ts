@@ -2,9 +2,9 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect whether tmux is available
+ * - Detect whether Herdr or tmux is available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in tmux panes
+ * - Start real pi sessions in terminal-multiplexer panes
  * - Poll for file creation and screen output
  * - Clean up panes and temp files after tests
  */
@@ -23,7 +23,8 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
-  isMuxAvailable,
+  isHerdrAvailable,
+  isTmuxAvailable,
   createSurface,
   createSurfaceSplit,
   sendCommand,
@@ -34,7 +35,7 @@ import {
   shellEscape,
 } from "../../pi-extension/subagents/tmux.ts";
 
-// Re-export tmux primitives for tests
+// Re-export terminal-surface primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
@@ -76,11 +77,13 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /**
- * Detect whether tmux is available in the current environment.
- * Returns ["tmux"] or [].
+ * Detect the active terminal multiplexer. Herdr is preferred when both are
+ * present because its stable pane ids are the source of truth in that case.
  */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["tmux"] : [];
+  if (isHerdrAvailable()) return ["herdr"];
+  if (isTmuxAvailable()) return ["tmux"];
+  return [];
 }
 
 export function focusSurface(surface: string): void {
@@ -110,7 +113,7 @@ export async function waitForFocusedSurface(
   }
 
   throw new Error(
-    `Timeout (${timeout}ms) waiting for focused tmux pane ${surface}; ` +
+    `Timeout (${timeout}ms) waiting for focused pane ${surface}; ` +
       `current focus is ${getFocusedSurface() ?? "unknown"}`,
   );
 }

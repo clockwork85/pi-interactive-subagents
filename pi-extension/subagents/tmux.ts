@@ -1,14 +1,15 @@
 /**
- * tmux surface layer — the only terminal multiplexer this extension supports.
+ * Terminal surface layer for Herdr and tmux.
  *
  * Everything the extension does to a pane goes through the small API in this
  * file: create/split a pane, type a command into it, read its screen, close
- * it, and poll for exit. Keeping the tmux calls isolated here means index.ts
- * stays testable without a multiplexer running.
+ * it, and poll for exit. Herdr is preferred when both environments are
+ * present. The filename remains `tmux.ts` for compatibility with existing
+ * imports and downstream tests.
  *
- * Panes are identified by tmux pane ids (e.g. `%12`). Splits always target
- * the parent pi's pane (`$TMUX_PANE`) so they follow the agent rather than
- * the user's focus.
+ * Herdr panes use stable ids such as `w1:p2` and are always targeted from the
+ * parent Pi pane in `$HERDR_PANE_ID`. tmux panes use ids such as `%12` and
+ * target `$TMUX_PANE`.
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
@@ -39,26 +40,30 @@ function hasCommand(command: string): boolean {
   return available;
 }
 
-/**
- * True when running inside tmux with the tmux binary on PATH.
- * `TMUX` is set by tmux in every process it spawns (shell or pane).
- */
+type MuxBackend = "herdr" | "tmux";
+
+/** True when running inside Herdr with the Herdr CLI on PATH. */
+export function isHerdrAvailable(): boolean {
+  return process.env.HERDR_ENV === "1" && !!process.env.HERDR_PANE_ID && hasCommand("herdr");
+}
+
+/** True when running inside tmux with the tmux binary on PATH. */
 export function isTmuxAvailable(): boolean {
   return !!process.env.TMUX && hasCommand("tmux");
 }
 
 export function isMuxAvailable(): boolean {
-  return isTmuxAvailable();
+  return isHerdrAvailable() || isTmuxAvailable();
 }
 
 export function muxSetupHint(): string {
-  return "Start pi inside tmux (`tmux new -A -s pi 'pi'`).";
+  return "Start Pi inside Herdr, or inside tmux if Herdr is unavailable.";
 }
 
-function requireTmux(): void {
-  if (!isTmuxAvailable()) {
-    throw new Error(`tmux is required for subagents. ${muxSetupHint()}`);
-  }
+function requireMux(): MuxBackend {
+  if (isHerdrAvailable()) return "herdr";
+  if (isTmuxAvailable()) return "tmux";
+  throw new Error(`A supported terminal multiplexer is required for subagents. ${muxSetupHint()}`);
 }
 
 // ── Shell helpers ──
@@ -66,6 +71,42 @@ function requireTmux(): void {
 export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
+
+interface HerdrPaneResponse {
+  result?: {
+    pane?: {
+      pane_id?: unknown;
+    };
+  };
+}
+
+function parseHerdrPaneId(raw: string): string {
+  let payload: HerdrPaneResponse;
+  try {
+    payload = JSON.parse(raw) as HerdrPaneResponse;
+  } catch {
+    throw new Error(`Unexpected Herdr pane response: ${raw.trim() || "(empty)"}`);
+  }
+  const paneId = payload.result?.pane?.pane_id;
+  if (typeof paneId !== "string" || !/^w[^:]+:p[^:]+$/.test(paneId)) {
+    throw new Error(`Herdr response did not contain a valid pane id: ${raw.trim()}`);
+  }
+  return paneId;
+}
+
+function herdrDirection(direction: "left" | "right" | "up" | "down"): "right" | "down" {
+  return direction === "left" || direction === "right" ? "right" : "down";
+}
+
+function requireHerdrParentPane(fromSurface?: string): string {
+  const pane = fromSurface ?? process.env.HERDR_PANE_ID;
+  if (!pane) {
+    throw new Error("HERDR_PANE_ID is missing; cannot target the parent Pi pane.");
+  }
+  return pane;
+}
+
+export const __surfaceTest__ = { parseHerdrPaneId, herdrDirection };
 
 // ── Pane layout ──
 
@@ -106,29 +147,48 @@ function rebalanceSurfaces(hintPane?: string): void {
 
 // ── Surface primitives ──
 
-/**
- * Create a new pane for a subagent: a right split off the parent pi's pane,
- * so new panes follow the agent rather than the user's focus.
- * See https://github.com/HazAT/pi-interactive-subagents/issues/12
- *
- * Returns the new pane id (e.g. `%12`).
- */
+/** Create a right-hand pane beside the parent Pi pane without stealing focus. */
 export function createSurface(name: string): string {
-  void name; // tmux panes are not named; the pi process inside shows its own title.
-  return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
+  const parentPane = isHerdrAvailable() ? process.env.HERDR_PANE_ID : process.env.TMUX_PANE;
+  return createSurfaceSplit(name, "right", parentPane);
 }
 
 /**
  * Create a new split in the given direction from an optional source pane.
- * Returns the new pane id (e.g. `%12`).
+ * Herdr currently exposes right/down splits; left/up requests preserve their
+ * axis and use right/down respectively. Returns an opaque backend pane id.
  */
 export function createSurfaceSplit(
   name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): string {
-  void name;
-  requireTmux();
+  const backend = requireMux();
+
+  if (backend === "herdr") {
+    const parentPane = requireHerdrParentPane(fromSurface);
+    const args = [
+      "pane",
+      "split",
+      "--pane",
+      parentPane,
+      "--direction",
+      herdrDirection(direction),
+      "--cwd",
+      process.cwd(),
+      "--no-focus",
+    ];
+    const raw = execFileSync("herdr", args, { encoding: "utf8" });
+    const pane = parseHerdrPaneId(raw);
+    try {
+      execFileSync("herdr", ["pane", "rename", pane, name], { encoding: "utf8" });
+    } catch {
+      // A cosmetic pane label must never make spawning fail.
+    }
+    return pane;
+  }
+
+  void name; // tmux panes are not named; the Pi process supplies its own title.
 
   const args = ["split-window", "-d"];
   if (direction === "left" || direction === "right") {
@@ -159,7 +219,11 @@ export function createSurfaceSplit(
  * then submitted with Enter.
  */
 export function sendCommand(surface: string, command: string): void {
-  requireTmux();
+  const backend = requireMux();
+  if (backend === "herdr") {
+    execFileSync("herdr", ["pane", "run", surface, command], { encoding: "utf8" });
+    return;
+  }
   execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
   execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
 }
@@ -206,7 +270,14 @@ export function sendLongCommand(
  * Read the screen contents of a pane (sync).
  */
 export function readScreen(surface: string, lines = 50): string {
-  requireTmux();
+  const backend = requireMux();
+  if (backend === "herdr") {
+    return execFileSync(
+      "herdr",
+      ["pane", "read", surface, "--source", "recent-unwrapped", "--lines", String(Math.max(1, lines))],
+      { encoding: "utf8" },
+    );
+  }
   return execFileSync(
     "tmux",
     ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
@@ -220,7 +291,15 @@ export function readScreen(surface: string, lines = 50): string {
  * Read the screen contents of a pane (async).
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
-  requireTmux();
+  const backend = requireMux();
+  if (backend === "herdr") {
+    const { stdout } = await execFileAsync(
+      "herdr",
+      ["pane", "read", surface, "--source", "recent-unwrapped", "--lines", String(Math.max(1, lines))],
+      { encoding: "utf8" },
+    );
+    return stdout;
+  }
   const { stdout } = await execFileAsync(
     "tmux",
     ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
@@ -230,10 +309,33 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 }
 
 /**
+ * Read the small bottom-of-terminal snapshot used for completion sentinels.
+ * Herdr's `recent-unwrapped` source preserves viewport padding, so asking for
+ * only five rows can return blank lines while the sentinel is still visible.
+ * Its `detection` source is purpose-built for bottom-buffer state checks.
+ */
+async function readSentinelScreenAsync(surface: string, lines = 5): Promise<string> {
+  const backend = requireMux();
+  if (backend === "herdr") {
+    const { stdout } = await execFileAsync(
+      "herdr",
+      ["pane", "read", surface, "--source", "detection", "--lines", String(Math.max(1, lines))],
+      { encoding: "utf8" },
+    );
+    return stdout;
+  }
+  return readScreenAsync(surface, lines);
+}
+
+/**
  * Close a pane.
  */
 export function closeSurface(surface: string): void {
-  requireTmux();
+  const backend = requireMux();
+  if (backend === "herdr") {
+    execFileSync("herdr", ["pane", "close", surface], { encoding: "utf8" });
+    return;
+  }
   execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
   rebalanceSurfaces();
 }
@@ -316,7 +418,7 @@ export async function pollForExit(
 
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
-      const screen = await readScreenAsync(surface, 5);
+      const screen = await readSentinelScreenAsync(surface, 5);
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };

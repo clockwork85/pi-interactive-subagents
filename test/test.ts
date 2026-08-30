@@ -1,7 +1,7 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
@@ -30,7 +30,7 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import { shellEscape, __surfaceTest__ } from "../pi-extension/subagents/tmux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -1206,13 +1206,19 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps custom tools and skips built-ins", () => {
-    assert.equal(testApi.getToolExtensionPath("read"), undefined);
-    assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
-    // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+  it("getToolExtensionPath maps custom tools and skips built-ins", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      const webSearchPath = join(globalDir, "extensions", "web-search", "index.ts");
+      mkdirSync(dirname(webSearchPath), { recursive: true });
+      writeFileSync(webSearchPath, "// test extension\n");
+
+      assert.equal(testApi.getToolExtensionPath("read"), undefined);
+      assert.equal(testApi.getToolExtensionPath("bash"), undefined);
+      assert.equal(testApi.getToolExtensionPath("web_search"), webSearchPath);
+      assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+      // Spawning tools are registered by this extension itself.
+      assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -2653,6 +2659,28 @@ describe("subagent display helpers", () => {
 });
 
 describe("tmux.ts", () => {
+  describe("Herdr surface helpers", () => {
+    it("extracts an opaque pane id from a split response", () => {
+      const raw = JSON.stringify({ result: { pane: { pane_id: "wK:p7" } } });
+      assert.equal(__surfaceTest__.parseHerdrPaneId(raw), "wK:p7");
+    });
+
+    it("rejects malformed split responses", () => {
+      assert.throws(
+        () => __surfaceTest__.parseHerdrPaneId(JSON.stringify({ result: { pane: {} } })),
+        /valid pane id/,
+      );
+      assert.throws(() => __surfaceTest__.parseHerdrPaneId("not json"), /Unexpected Herdr pane response/);
+    });
+
+    it("maps unsupported before-split directions onto Herdr's available axes", () => {
+      assert.equal(__surfaceTest__.herdrDirection("left"), "right");
+      assert.equal(__surfaceTest__.herdrDirection("right"), "right");
+      assert.equal(__surfaceTest__.herdrDirection("up"), "down");
+      assert.equal(__surfaceTest__.herdrDirection("down"), "down");
+    });
+  });
+
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");
